@@ -176,6 +176,22 @@
 
   function tabModel() {
     var s = S.settings;
+
+    /* ---------- переключатель LOCAL / ONLINE ---------- */
+    var provOpts = [
+      ["ollama", "LOCAL — Ollama (локальная модель)"],
+      ["freellmapi", "ONLINE — FreeLLMAPI (онлайн-модели)"],
+    ];
+    var providerSel = M.select(provOpts, s.provider || "ollama");
+    var ollamaBox = h("div", null);
+    var onlineBox = h("div", null);
+
+    function syncProviderBoxes() {
+      ollamaBox.style.display = providerSel.value === "ollama" ? "" : "none";
+      onlineBox.style.display = providerSel.value === "freellmapi" ? "" : "none";
+    }
+
+    /* ---------- секция Ollama ---------- */
     var url = M.input(s.ollama_url);
     var model = M.input(s.model, { list: "model-list", placeholder: "например, molly-pto", autocomplete: "off" });
     var datalist = h("datalist", { id: "model-list" });
@@ -222,24 +238,127 @@
       }
     }
 
-    var root = panel("Модель", "Подключение к Ollama и параметры генерации.");
-    root.appendChild(M.field("Адрес Ollama", h("div", null,
+    /* ---------- секция FreeLLMAPI ---------- */
+    var flUrl = M.input((s.freellmapi && s.freellmapi.url) || "http://127.0.0.1:31415");
+    var flKey = M.input("", { type: "password", placeholder: (s.freellmapi && s.freellmapi.key_masked) ? "Сохранён: " + s.freellmapi.key_masked + " (введите для замены)" : "API-ключ (не обязателен локально)", autocomplete: "off" });
+    var flResult = h("div", { style: { marginTop: "8px" } });
+    var modeOpts = [
+      ["auto", "AUTO — самая мощная доступная модель"],
+      ["manual", "Ручной выбор модели"],
+    ];
+    var flMode = M.select(modeOpts, s.model_mode || "auto");
+    var flModelSel = M.select([["", "—"]], "");
+
+    async function refreshFlModels() {
+      try {
+        var r = await M.api("/api/freellmapi/status?refresh=true");
+        S.freellm = r;
+        M.clear(flModelSel);
+        flModelSel.appendChild(h("option", { value: "", text: "AUTO — лучшая доступная" }));
+        (r.models || []).forEach(function (m) {
+          flModelSel.appendChild(h("option", { value: m.id, text: (m.available ? "" : "⏳ ") + (m.name || m.id) }));
+        });
+        var saved = s.online_model || "";
+        flModelSel.value = saved;
+        if (flModelSel.value !== saved) {
+          // сохранённой модели нет в списке — добавим, чтобы не потерять выбор
+          flModelSel.appendChild(h("option", { value: saved, text: saved + " (из настроек)" }));
+          flModelSel.value = saved;
+        }
+        return r;
+      } catch (e) { return { connected: false, error: e.message }; }
+    }
+
+    async function checkFreellm() {
+      M.clear(flResult);
+      flResult.appendChild(h("span", { class: "spinner" }));
+      try {
+        var r = await M.api("/api/freellmapi/test", { method: "POST", body: { url: flUrl.value.trim() } });
+        M.clear(flResult);
+        if (r.ok) {
+          flResult.appendChild(h("span", { class: "chip ok" }, h("span", { class: "dot" }),
+            "Подключено · моделей: " + (r.models_count != null ? r.models_count : "—")));
+          var rr = await refreshFlModels();
+          if (rr && rr.active_name) {
+            flResult.appendChild(h("div", { class: "hint", text: "Текущая лучшая модель AUTO: " + rr.active_name }));
+          }
+        } else {
+          flResult.appendChild(h("div", { class: "msg-error", text: r.error || "FreeLLMAPI недоступен" }));
+        }
+      } catch (e) {
+        M.clear(flResult);
+        flResult.appendChild(h("div", { class: "msg-error", text: e.message }));
+      }
+    }
+
+    async function saveFlKey(st) {
+      var key = flKey.value.trim();
+      if (!key) return true;
+      try {
+        await M.api("/api/freellmapi/key", { method: "POST", body: { api_key: key } });
+        flKey.value = "";
+        if (S.settings && S.settings.freellmapi) S.settings.freellmapi.key_set = true;
+        return true;
+      } catch (e) {
+        st.className = "status-text bad"; st.textContent = e.message;
+        return false;
+      }
+    }
+
+    providerSel.addEventListener("change", syncProviderBoxes);
+
+    var root = panel("Модель", "Локальная модель (Ollama) или онлайн-модели (FreeLLMAPI). Индекс документов одинаков для обоих режимов.");
+    root.appendChild(M.field("Источник ответов", providerSel,
+      "LOCAL: документы не покидают компьютер. ONLINE: МОЛЛИ отправляет только найденные фрагменты, не папку целиком."));
+
+    ollamaBox.appendChild(M.field("Адрес Ollama", h("div", null,
       h("div", { class: "row" }, h("div", { class: "grow" }, url), h("button", { class: "btn", text: "Проверить подключение", onclick: check })),
       result), "Обычно http://127.0.0.1:11434. Ollama работает на вашем компьютере, документы никуда не отправляются."));
-    root.appendChild(M.field("Модель", h("div", null, model, datalist), "Выберите из списка или введите имя вручную."));
-    root.appendChild(h("div", { class: "cols" },
+    ollamaBox.appendChild(M.field("Модель", h("div", null, model, datalist), "Выберите из списка или введите имя вручную."));
+    ollamaBox.appendChild(h("div", { class: "cols" },
       M.field("Temperature", temp, "0 — строго и предсказуемо, 1 и выше — свободнее. Для документов лучше 0.1–0.4."),
       M.field("Максимум токенов в ответе", maxTok, "Ограничивает длину ответа.")));
-    root.appendChild(h("div", { class: "cols" },
+    ollamaBox.appendChild(h("div", { class: "cols" },
       M.field("Контекст (токенов)", ctx, "Сколько текста модель «видит» за раз. Больше — точнее по документам, но требует больше оперативной памяти."),
       M.field("Держать модель в памяти", keep, "После этого времени модель выгружается из памяти — приложение не занимает RAM, пока вы им не пользуетесь.")));
-    root.appendChild(saveBar(async function (st) {
+    ollamaBox.appendChild(saveBar(async function (st) {
       var ok = await save({
         ollama_url: url.value, model: model.value.trim(), temperature: Number(temp.value),
         num_ctx: Number(ctx.value), max_tokens: Number(maxTok.value), keep_alive: keep.value,
+        provider: providerSel.value,
       }, st);
       if (ok) M.checkOllama(true);
     }));
+
+    onlineBox.appendChild(M.field("URL FreeLLMAPI", h("div", null,
+      h("div", { class: "row" }, h("div", { class: "grow" }, flUrl), h("button", { class: "btn", text: "Проверить подключение", onclick: checkFreellm })),
+      flResult), "Обычно http://127.0.0.1:31415."));
+    onlineBox.appendChild(M.field("API-ключ", flKey, "Хранится в защищённом хранилище Windows (DPAPI), не показывается открытым текстом и не попадает в логи."));
+    onlineBox.appendChild(h("div", { class: "cols" },
+      M.field("Режим выбора модели", flMode, "AUTO — МОЛЛИ сама выбирает самую мощную доступную модель и автоматически переключается при ошибках (429/503/timeout) с последующим возвратом."),
+      M.field("Модель (для ручного режима)", flModelSel, "Список загружается динамически из /v1/models FreeLLMAPI.")));
+    onlineBox.appendChild(saveBar(async function (st) {
+      if (!(await saveFlKey(st))) return;
+      var patch = {
+        provider: providerSel.value,
+        model_mode: flMode.value,
+        online_model: flMode.value === "manual" ? flModelSel.value : "",
+        freellmapi: { enabled: providerSel.value === "freellmapi", url: flUrl.value.trim() },
+      };
+      var ok = await save(patch, st);
+      if (ok) { M.checkFreellm(false); M.renderTopbar(); }
+    }));
+    refreshFlModels().then(function (r) {
+      if (r && r.connected) {
+        M.clear(flResult);
+        M.clear(flResult);
+        flResult.appendChild(h("span", { class: "chip ok" }, h("span", { class: "dot" }), "Подключено · моделей: " + (r.models_count || 0)));
+      }
+    });
+
+    root.appendChild(ollamaBox);
+    root.appendChild(onlineBox);
+    syncProviderBoxes();
     check();
     return root;
   }
