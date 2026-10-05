@@ -48,6 +48,14 @@ FTS_COLUMNS = (
     "text_content",
 )
 
+# ВАЖНО: у external-content таблицы (content='documents') SQLite при
+# запросе сам подтягивает колонки из исходной таблицы, поэтому такие
+# строки корректно работают и с bm25(), и с snippet().
+#
+# Раньше использовалась contentless-таблица (content=''): в неё можно
+# было вставить токены, но прочитать обратно — нет (ошибка
+# "unknown column"), из-за чего весь FTS-поиск молча падал в запасной
+# LIKE-поиск и не находил ничего, чего нет в метаданных.
 FTS_CREATE_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts
 USING fts5(
@@ -60,11 +68,30 @@ USING fts5(
     work,
     construction,
     material,
-    text_content,
-    content='',
+    text_content UNINDEXED,
+    content='documents',
+    content_rowid='id',
     tokenize='unicode61'
 );
 """
+
+
+def _sqlite_supports_delete_all(conn: sqlite3.Connection) -> bool:
+    """
+    Команда 'delete-all' появилась в SQLite 3.43.0 (2023-10).
+    """
+
+    parts = conn.execute("SELECT sqlite_version()").fetchone()[0].split(".")
+
+    try:
+        version = tuple(int(p) for p in parts[:3])
+    except ValueError:
+        return False
+
+    if len(version) < 3:
+        version = (*version, *(0,) * (3 - len(version)))
+
+    return version >= (3, 43, 0)
 
 
 def project_db_path(project_path: str | Path) -> Path:
@@ -219,6 +246,107 @@ _initialized: set[str] = set()
 _init_lock = threading.Lock()
 
 
+def _fts_table_sql(db_path: str | Path) -> str:
+    """
+    Возвращает SQL определения таблицы documents_fts из sqlite_master.
+    Пустая строка — если таблицы нет.
+    """
+
+    conn = sqlite3.connect(str(db_path), timeout=SQLITE_TIMEOUT)
+
+    try:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='documents_fts'"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    return (row[0] or "") if row else ""
+
+
+@retry_on_busy
+def _migrate_fts_to_external_content(db_path: str | Path) -> bool:
+    """
+    Миграция старой contentless-схемы FTS (content='') на
+    external-content (content='documents').
+
+    У contentless-таблицы SQLite не умеет читать колонки обратно,
+    поэтому любой запрос с bm25()/snippet() падал с ошибкой
+    'unknown column', и весь полнотекстовый поиск молча
+    скатывался в LIKE по метаданным — «МОЛЛИ не видит файлы».
+
+    Миграция безопасна: старые данные FTS всё равно нельзя было
+    прочитать, индекс пересобирается из documents + document_text.
+
+    Возвращает True, если миграция была выполнена.
+    """
+
+    ddl = _fts_table_sql(db_path)
+
+    # Таблицы нет — схема создаст её сама при необходимости.
+    if not ddl:
+        return False
+
+    # Уже external-content или обычный external-content по умолчанию.
+    normalized = " ".join(ddl.lower().split())
+
+    if "content='documents'" in normalized or "content=\"documents\"" in normalized:
+        return False
+
+    logger.warning(
+        "FTS: обнаружена устаревшая contentless-схема, выполняется "
+        "миграция на external-content: %s",
+        db_path,
+    )
+
+    with connect_db(db_path) as conn:
+
+        conn.execute("DROP TABLE IF EXISTS documents_fts")
+
+        conn.execute(FTS_CREATE_SQL.strip().rstrip(";"))
+
+        conn.commit()
+
+        count = _rebuild_fts_from_data(conn)
+
+        conn.commit()
+
+    logger.info(
+        "FTS мигрирован и пересобран: %d документов",
+        count,
+    )
+
+    return True
+
+
+def _rebuild_fts_from_data(conn: sqlite3.Connection) -> int:
+    """
+    Заполняет external-content FTS-таблицу данными из
+    documents + document_text. Возвращает число записей.
+    """
+
+    conn.execute(
+        "INSERT INTO documents_fts (rowid, "
+        + ", ".join(FTS_COLUMNS)
+        + ") "
+        "SELECT d.id, "
+        "COALESCE(d.filename,''), COALESCE(d.full_path,''), "
+        "COALESCE(d.section,''), COALESCE(d.document_type,''), "
+        "COALESCE(d.category,''), COALESCE(d.document_number,''), "
+        "COALESCE(d.work,''), COALESCE(d.construction,''), "
+        "COALESCE(d.material,''), COALESCE(t.text_content,'') "
+        "FROM documents d "
+        "LEFT JOIN document_text t ON t.document_id = d.id"
+    )
+
+    row = conn.execute(
+        "SELECT COUNT(*) FROM documents_fts"
+    ).fetchone()
+
+    return int(row[0]) if row else 0
+
+
 def initialize_database(
     project_path: str | Path,
     force: bool = False,
@@ -245,6 +373,8 @@ def initialize_database(
     with _init_lock:
 
         _create_schema(project_path)
+
+        _migrate_fts_to_external_content(db_path)
 
         _initialized.add(key)
 
@@ -894,13 +1024,31 @@ def get_index_status(
 # FTS maintenance
 # ============================================================
 
+# Таблица внешнесодержимая (content='documents'), поэтому в неё
+# НЕЛЬЗЯ вставлять значения напрямую — вместо этого строка индекса
+# пересобирается командой 'replace' из актуальных данных documents
+# и document_text. Удаление — команда 'delete' с теми же значениями,
+# что были проиндексированы (её тоже берём из БД ДО изменений).
+
+_FTS_SELECT_SQL = """
+SELECT
+    d.filename, d.full_path, d.section, d.document_type,
+    d.category, d.document_number, d.work, d.construction,
+    d.material,
+    t.text_content AS text_content
+FROM documents d
+LEFT JOIN document_text t
+    ON t.document_id = d.id
+WHERE d.id = ?
+"""
+
+
 def _fts_values(
     row: sqlite3.Row,
     text: str,
 ) -> tuple[str, ...]:
     """
-    Значения колонок FTS в том же порядке и виде (None -> ""),
-    в каком их вставляет индексатор.
+    Значения колонок FTS в зафиксированном порядке (None -> "").
     """
 
     return (
@@ -917,33 +1065,36 @@ def _fts_values(
     )
 
 
-_FTS_INSERT_SQL = (
-    "INSERT INTO documents_fts (rowid, "
-    + ", ".join(FTS_COLUMNS)
-    + ") VALUES (?"
-    + ", ?" * len(FTS_COLUMNS)
-    + ")"
-)
-
-_FTS_DELETE_SQL = (
-    "INSERT INTO documents_fts (documents_fts, rowid, "
-    + ", ".join(FTS_COLUMNS)
-    + ") VALUES ('delete', ?"
-    + ", ?" * len(FTS_COLUMNS)
-    + ")"
-)
-
-
-def fts_insert_document(
+def fts_sync_document(
     conn: sqlite3.Connection,
     document_id: int,
-    values: tuple[str, ...],
-) -> None:
+) -> bool:
+    """
+    Синхронизирует индекс FTS с текущим содержимым документов
+    (documents + document_text). Вызывать ПОСЛЕ записи/обновления
+    строки документа в той же транзакции.
+
+    Возвращает True, если документ найден в БД.
+    """
+
+    row = conn.execute(_FTS_SELECT_SQL, (document_id,)).fetchone()
+
+    if row is None:
+        return False
 
     conn.execute(
-        _FTS_INSERT_SQL,
-        (document_id, *values),
+        "INSERT INTO documents_fts (documents_fts, rowid, "
+        + ", ".join(FTS_COLUMNS)
+        + ") VALUES ('replace', ?"
+        + ", ?" * len(FTS_COLUMNS)
+        + ")",
+        (
+            document_id,
+            *_fts_values(row, row["text_content"] or ""),
+        ),
     )
+
+    return True
 
 
 def fts_delete_document(
@@ -951,43 +1102,29 @@ def fts_delete_document(
     document_id: int,
 ) -> bool:
     """
-    Убирает документ из contentless FTS5.
+    Убирает документ из FTS-индекса.
 
-    Для таблиц content='' обычный DELETE запрещён
-    ("cannot DELETE from contentless fts5 table"), поэтому используется
-    команда 'delete' с ТЕМИ ЖЕ значениями, что были вставлены.
-    Их берём из documents и document_text — поэтому вызывать нужно
-    ДО изменения/удаления этих строк.
+    Вызывать ДО удаления/изменения строк documents и document_text:
+    для таблицы content='documents' команда 'delete' должна получить
+    РОВНО те значения, которые были проиндексированы.
 
     Возвращает True, если запись была удалена.
     """
 
-    row = conn.execute(
-        """
-        SELECT
-            d.filename, d.full_path, d.section, d.document_type,
-            d.category, d.document_number, d.work, d.construction,
-            d.material,
-            t.text_content AS text_content
-        FROM documents d
-        LEFT JOIN document_text t
-            ON t.document_id = d.id
-        WHERE d.id = ?
-        """,
-        (document_id,),
-    ).fetchone()
+    row = conn.execute(_FTS_SELECT_SQL, (document_id,)).fetchone()
 
     if row is None:
         return False
 
     conn.execute(
-        _FTS_DELETE_SQL,
+        "INSERT INTO documents_fts (documents_fts, rowid, "
+        + ", ".join(FTS_COLUMNS)
+        + ") VALUES ('delete', ?"
+        + ", ?" * len(FTS_COLUMNS)
+        + ")",
         (
             document_id,
-            *_fts_values(
-                row,
-                row["text_content"] or "",
-            ),
+            *_fts_values(row, row["text_content"] or ""),
         ),
     )
 
@@ -1007,53 +1144,38 @@ def rebuild_fts(project_path: str | Path) -> int:
 
     initialize_database(project_path)
 
-    count = 0
-
     with connect_db(project_path) as conn:
 
-        try:
-
-            conn.execute(
-                "INSERT INTO documents_fts(documents_fts) "
-                "VALUES('delete-all')"
-            )
-
-        except sqlite3.OperationalError:
-
-            # Старый SQLite без 'delete-all' — пересоздаём таблицу.
-            conn.execute(
-                "DROP TABLE IF EXISTS documents_fts"
-            )
-
-            conn.execute(
-                FTS_CREATE_SQL.strip().rstrip(";")
-            )
-
-        cursor = conn.execute(
-            """
-            SELECT
-                d.id, d.filename, d.full_path, d.section,
-                d.document_type, d.category, d.document_number,
-                d.work, d.construction, d.material,
-                t.text_content AS text_content
-            FROM documents d
-            LEFT JOIN document_text t
-                ON t.document_id = d.id
-            """
+        # Проверяем актуальность схемы (на случай, если миграция
+        # ещё не выполнялась для этой БД в этом процессе).
+        ddl = " ".join(
+            (
+                conn.execute(
+                    "SELECT sql FROM sqlite_master "
+                    "WHERE type='table' AND name='documents_fts'"
+                ).fetchone() or ("",)
+            )[0].lower().split()
         )
 
-        for row in cursor:
+        if "content='documents'" not in ddl and 'content="documents"' not in ddl:
+            # Устаревшая contentless-схема — пересоздаём таблицу.
+            conn.execute("DROP TABLE IF EXISTS documents_fts")
+            conn.execute(FTS_CREATE_SQL.strip().rstrip(";"))
+            conn.commit()
 
-            fts_insert_document(
-                conn,
-                int(row["id"]),
-                _fts_values(
-                    row,
-                    row["text_content"] or "",
-                ),
+        try:
+            conn.execute(
+                "INSERT INTO documents_fts(documents_fts) "
+                "VALUES('rebuild')"
             )
-
-            count += 1
+            count_row = conn.execute(
+                "SELECT COUNT(*) FROM documents"
+            ).fetchone()
+            count = int(count_row[0]) if count_row else 0
+        except sqlite3.OperationalError:
+            # 'rebuild' недоступен — заполняем индекс напрямую.
+            conn.execute("DELETE FROM documents_fts")
+            count = _rebuild_fts_from_data(conn)
 
         conn.commit()
 
