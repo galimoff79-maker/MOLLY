@@ -446,10 +446,17 @@
         asst.content += ev.text;
         if (node) scheduleRender(node, asst);
         break;
+      case "model":
+        // автоматическая смена модели FreeLLMAPI — ненавязчивое уведомление
+        if (ev.fallback) {
+          M.toast("Модель временно недоступна. Автоматически подключена: " + (ev.model || "?"), false);
+        }
+        break;
       case "error":
         asst.error = ev.message;
         asst.retryText = S.messages[S.messages.length - 2] && S.messages[S.messages.length - 2].content;
         if (ev.code === "ollama_unavailable" || ev.code === "model_not_found") M.checkOllama(true);
+        if (ev.code === "online_unavailable" || ev.code === "online_models_exhausted") M.checkFreellm(false);
         break;
       case "done":
         asst.stopped = !!ev.stopped;

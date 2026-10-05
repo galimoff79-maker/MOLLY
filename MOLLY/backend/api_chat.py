@@ -92,8 +92,15 @@ async def api_ui_config(request: Request) -> dict[str, Any]:
 
 @router.get("/settings")
 async def api_settings_get() -> dict[str, Any]:
-
-    return await asyncio.to_thread(settings_store.get)
+    s = await asyncio.to_thread(settings_store.get)
+    # маска наличия API-ключа для UI (сам ключ никогда не отдаётся)
+    try:
+        key = llm_online.resolve_api_key(s)
+        s.setdefault("freellmapi", {})["key_masked"] = llm_online.mask_key(key) if key else ""
+        s["freellmapi"]["key_set"] = bool(key)
+    except Exception:
+        logger.exception("Не удалось получить маску API-ключа")
+    return s
 
 
 @router.put("/settings")
@@ -230,7 +237,7 @@ async def api_freellmapi_test(body: FreeLLMApiTestBody) -> dict[str, Any]:
     s = await asyncio.to_thread(settings_store.get)
     base = (body.url or s.get("freellmapi", {}).get("url") or config.FREELLMAPI_BASE_URL).strip().rstrip("/")
     key = body.api_key or llm_online.resolve_api_key(s)
-    result: dict[str, Any] = {"url": base, "connected": False, "models_count": 0, "error": None}
+    result: dict[str, Any] = {"url": base, "connected": False, "ok": False, "models_count": 0, "error": None}
     try:
         req = urllib.request.Request(
             base + "/v1/models",
@@ -240,6 +247,7 @@ async def api_freellmapi_test(body: FreeLLMApiTestBody) -> dict[str, Any]:
             data = json.loads(resp.read().decode("utf-8"))
         models = data.get("data") or []
         result["connected"] = True
+        result["ok"] = True
         result["models_count"] = len(models)
     except urllib.error.HTTPError as exc:
         result["error"] = f"HTTP {exc.code}: {exc.reason}"

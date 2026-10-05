@@ -2,17 +2,9 @@
 __pycache__/
 *.pyc
 
-# Environment and secrets
-.env
-.env.local
-*.env.*
+# Logs and temporary data
+*.log
+data/logs/
 
-# Editor/IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# System files
-.DS_Store
-Thumbs.db
+# Backup files (generated)
+data/backups/
