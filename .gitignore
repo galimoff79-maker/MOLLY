@@ -1,6 +1,18 @@
-# Python bytecode and caches
+# Python compiled files
 __pycache__/
 *.pyc
 
-# Logs
-*.log
+# Environment and secrets
+.env
+.env.local
+*.env.*
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# System files
+.DS_Store
+Thumbs.db

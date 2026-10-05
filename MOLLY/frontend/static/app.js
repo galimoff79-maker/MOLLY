@@ -7,6 +7,31 @@
 
   /* ---------- состояние сервисов ---------- */
 
+  M.checkFreellm = async function (refresh) {
+    if (!S.cfg || !S.cfg.is_local) return;
+    try {
+      S.freellm = await M.api("/api/freellmapi/status" + (refresh ? "?refresh=true" : ""));
+    } catch (e) {
+      S.freellm = { ok: false, connected: false, models_count: 0, error: e.message, models: [] };
+    }
+    M.renderTopbar();
+    if (M.refreshBanners) M.refreshBanners();
+  };
+
+  // Смена модели/провайдера из топбара. mode: "auto" | "manual", model: id или "".
+  M.setModelChoice = async function (mode, model) {
+    var data = { model_mode: mode };
+    if (mode === "manual") { data.online_model = model; data.provider = "freellmapi"; }
+    else if (model === "") { data.online_model = ""; }
+    try {
+      S.settings = await M.api("/api/settings", { method: "PUT", body: { data: data } });
+      S.cfg.model_mode = S.settings.model_mode;
+      S.cfg.online_model = S.settings.online_model;
+      S.cfg.provider = S.settings.provider;
+      M.checkFreellm(false);
+    } catch (e) { M.toast(e.message, true); }
+  };
+
   M.checkOllama = async function (force) {
     if (!S.cfg || !S.cfg.is_local) return;
     try {
@@ -106,6 +131,24 @@
 
     if (S.view === "chat") {
       if (local) {
+        var provider = S.cfg.provider || "ollama";
+        if (provider === "freellmapi") {
+          var fl = S.freellm || {};
+          var models = fl.models || [];
+          var modeSel = S.cfg.model_mode || "auto";
+          var sel2 = h("select", { class: "input model-select", "aria-label": "Модель FreeLLMAPI", title: "Модель FreeLLMAPI" });
+          sel2.appendChild(h("option", { value: "auto", text: "AUTO — самая мощная доступная" }));
+          models.slice(0, 300).forEach(function (m) {
+            sel2.appendChild(h("option", { value: m.id, text: (m.available ? "" : "⏳ ") + (m.name || m.id) }));
+          });
+          sel2.value = modeSel === "manual" && S.cfg.online_model ? S.cfg.online_model : "auto";
+          if (!sel2.value) sel2.value = "auto";
+          sel2.addEventListener("change", function () {
+            if (sel2.value === "auto") M.setModelChoice("auto", "");
+            else M.setModelChoice("manual", sel2.value);
+          });
+          bar.appendChild(sel2);
+        } else {
         var models = (S.ollama && S.ollama.models) || [];
         var current = (S.settings && S.settings.model) || S.cfg.model || "";
         var sel = h("select", { class: "input model-select", "aria-label": "Модель", title: "Модель" });
@@ -122,6 +165,7 @@
           } catch (e) { M.toast(e.message, true); }
         });
         bar.appendChild(sel);
+        }
       } else if (S.cfg.model) {
         bar.appendChild(h("span", { class: "chip", text: "Модель: " + S.cfg.model }));
       }
@@ -129,7 +173,21 @@
 
     bar.appendChild(h("div", { class: "grow" }));
 
-    if (local) {
+    if (local && (S.cfg.provider || "ollama") === "freellmapi") {
+      var fl2 = S.freellm;
+      var activeName = fl2 && (fl2.active_name || fl2.active_model);
+      var modeLabel = (S.cfg.model_mode === "manual" && S.cfg.online_model) ? "Ручной" : "AUTO";
+      bar.appendChild(h("button", {
+        class: "chip " + (fl2 ? (fl2.connected ? "ok" : "bad") : ""),
+        style: { cursor: "pointer" },
+        title: fl2 && !fl2.connected ? (fl2.error || "FreeLLMAPI недоступен") : "Статус FreeLLMAPI",
+        onclick: function () { M.openSettings("model"); },
+      },
+        h("span", { class: "dot" }),
+        fl2
+          ? ("FreeLLMAPI · " + (activeName ? activeName : "нет моделей") + " · " + modeLabel)
+          : "FreeLLMAPI…"));
+    } else if (local) {
       var o = S.ollama;
       bar.appendChild(h("button", { class: "chip " + (o ? (o.ok ? "ok" : "bad") : ""), style: { cursor: "pointer" }, title: o && !o.ok ? o.error : "Подключение к Ollama",
         onclick: function () { M.openSettings("model"); } },

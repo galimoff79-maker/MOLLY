@@ -14,6 +14,7 @@
       abort: null,
       useDocs: true,
       ollama: null,       // результат /api/ollama/status
+      freellm: null,      // результат /api/freellmapi/status
       index: null,        // результат /api/index/status
       project: null,
     },
