@@ -17,7 +17,7 @@ from config import (
 from database import (
     connect_db,
     fts_delete_document,
-    fts_insert_document,
+    fts_sync_document,
     get_document_by_path,
     initialize_database,
     update_index_status,
@@ -91,11 +91,12 @@ class ProjectIndexer:
 
         # Состояние одного прогона (сбрасывается в run()).
         #
-        # _known — {full_path: (size, mtime, parser_status)} из БД,
-        #   загружается ОДНИМ запросом (вместо запроса на каждый файл).
+        # _known — {full_path: (size, mtime, parser_status, file_hash)}
+        #   из БД, загружается ОДНИМ запросом (вместо запроса на
+        #   каждый файл).
         # _structure_seen — папки, уже записанные в project_structure
         #   (вместо UPSERT всех родителей на каждый файл).
-        self._known: dict[str, tuple[int, float, str]] | None = None
+        self._known: dict[str, tuple[int, float, str, str]] | None = None
 
         self._structure_seen: set[str] = set()
 
@@ -191,6 +192,8 @@ class ProjectIndexer:
 
         key = str(scanned.path)
 
+        old_hash = ""
+
         if self._known is not None:
 
             known = self._known.get(key)
@@ -198,7 +201,9 @@ class ProjectIndexer:
             if known is None:
                 return False
 
-            old_size, old_mtime, old_status = known
+            old_size, old_mtime, old_status = known[:3]
+
+            old_hash = known[3] if len(known) > 3 else ""
 
         else:
 
@@ -222,26 +227,68 @@ class ProjectIndexer:
                 row["parser_status"] or ""
             )
 
+            try:
+                old_hash = str(row["file_hash"] or "")
+            except (IndexError, KeyError):
+                old_hash = ""
+
         # Файл, который в прошлый раз не удалось прочитать
         # (например, был открыт/заблокирован в Excel на Windows),
         # нужно пробовать снова, даже если размер и время те же.
         if old_status == "error":
             return False
 
-        # Размер и время совпадают.
-        #
-        # Для обычного рабочего проекта этого
-        # достаточно для быстрого incremental scan.
-        return (
-            old_size == scanned.size_bytes
-            and abs(
-                old_mtime - scanned.mtime
-            ) < 0.0001
-        )
+        size_matches = old_size == scanned.size_bytes
 
-    def _load_known(self) -> dict[str, tuple[int, float, str]]:
+        mtime_matches = abs(
+            old_mtime - scanned.mtime
+        ) < 0.0001
 
-        known: dict[str, tuple[int, float, str]] = {}
+        # Быстрый путь: размер и время совпадают.
+        if size_matches and mtime_matches:
+
+            # Если при прошлой индексации хэш не сохранился
+            # (старые базы) — доверяем размеру и времени.
+            if not old_hash:
+                return True
+
+            # Надёжная проверка: файл мог быть отредактирован
+            # без изменения размера (или с восстановленным mtime).
+            try:
+                new_hash = self._file_hash(scanned.path)
+            except Exception as exc:
+                logger.warning(
+                    "Не удалось вычислить хэш %s: %s",
+                    key,
+                    exc,
+                )
+                return False
+
+            return new_hash == old_hash
+
+        # Время изменилось, а размер нет (или наоборот) —
+        # сравниваем хэши, чтобы не переиндексировать зря.
+        if size_matches and old_hash:
+
+            try:
+                new_hash = self._file_hash(scanned.path)
+            except Exception as exc:
+                logger.warning(
+                    "Не удалось вычислить хэш %s: %s",
+                    key,
+                    exc,
+                )
+                return False
+
+            return new_hash == old_hash
+
+        return False
+
+    def _load_known(
+        self,
+    ) -> dict[str, tuple[int, float, str, str]]:
+
+        known: dict[str, tuple[int, float, str, str]] = {}
 
         with connect_db(
             self.project_path
@@ -253,7 +300,8 @@ class ProjectIndexer:
                     full_path,
                     size_bytes,
                     mtime,
-                    parser_status
+                    parser_status,
+                    file_hash
                 FROM documents
                 """
             ):
@@ -262,6 +310,7 @@ class ProjectIndexer:
                     int(row["size_bytes"] or 0),
                     float(row["mtime"] or 0),
                     str(row["parser_status"] or ""),
+                    str(row["file_hash"] or ""),
                 )
 
         return known
@@ -768,12 +817,9 @@ class ProjectIndexer:
             # FTS
             # ------------------------------------------------
 
-            self._update_fts(
+            fts_sync_document(
                 conn,
                 document_id,
-                scanned,
-                analysis,
-                text,
             )
 
             conn.commit()
@@ -790,6 +836,7 @@ class ProjectIndexer:
                 scanned.size_bytes,
                 scanned.mtime,
                 str(extracted.status or ""),
+                file_hash,
             )
 
         return document_id
@@ -920,43 +967,6 @@ class ProjectIndexer:
                 item_type,
                 path.suffix.lower(),
                 depth,
-            ),
-        )
-
-    # ========================================================
-    # FTS
-    # ========================================================
-
-    @staticmethod
-    def _update_fts(
-        conn: sqlite3.Connection,
-        document_id: int,
-        scanned: ScannedFile,
-        analysis: Any,
-        text: str,
-    ) -> None:
-
-        # Старая запись (если была) уже удалена в _save_document
-        # через fts_delete_document — у contentless FTS5 обычный
-        # DELETE запрещён.
-        fts_insert_document(
-            conn,
-            document_id,
-            (
-                scanned.filename,
-                str(scanned.path),
-
-                analysis.section or "",
-                analysis.document_type or "",
-                analysis.category or "",
-
-                analysis.document_number or "",
-
-                analysis.work or "",
-                analysis.construction or "",
-                analysis.material or "",
-
-                text,
             ),
         )
 
