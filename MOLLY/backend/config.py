@@ -123,6 +123,29 @@ OLLAMA_DEFAULT_MODEL = os.getenv(
 
 
 # ------------------------------------------------------------
+# FreeLLMAPI (онлайн-провайдер OpenAI-compatible)
+# ------------------------------------------------------------
+
+FREELLMAPI_BASE_URL = os.getenv(
+    "FREELLMAPI_BASE_URL",
+    "http://127.0.0.1:31415",
+).rstrip("/")
+
+# API-ключ берётся только из окружения / защищённого хранилища
+# (secrets_store), никогда не хранится в коде и настройках.
+FREELLMAPI_API_KEY_ENV = "FREELLMAPI_API_KEY"
+
+# Лимит тела запроса для онлайн-API (128 КБ, как у FreeLLMAPI),
+# с запасом на JSON-экранирование и системный промпт.
+FREELLMAPI_MAX_REQUEST_BYTES = int(
+    os.getenv(
+        "MOLLY_FREELLMAPI_MAX_REQUEST_BYTES",
+        str(120_000),
+    )
+)
+
+
+# ------------------------------------------------------------
 # HTTP
 # ------------------------------------------------------------
 

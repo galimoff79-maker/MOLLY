@@ -13,8 +13,10 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+import chats_store  # noqa: F401  (косвенно, через api_chat)
 import index_runner
 import lan
+import llm_online
 import settings_store
 from api import router as project_router
 from api_chat import router as chat_router
@@ -91,6 +93,23 @@ def _startup_sync() -> None:
             settings_store.update({"lan": {"enabled": False}})
 
 
+def _models_health_loop(stop: threading.Event) -> None:
+    """Периодический health check FreeLLMAPI и обновление реестра моделей.
+
+    Работает, только если FreeLLMAPI включён в настройках. Индекс файлов
+    при этом не затрагивается — цикл обращается только к Model Manager.
+    """
+
+    while not stop.wait(30):
+        try:
+            settings = settings_store.get()
+            if not settings.get("freellmapi", {}).get("enabled"):
+                continue
+            llm_online.get_manager(settings).registry(settings).refresh()
+        except Exception:
+            logger.exception("Цикл проверки FreeLLMAPI завершился с ошибкой")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
@@ -104,6 +123,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         target=index_runner.scheduler_loop,
         args=(lambda: get_project_manager().project_path, _scheduler_stop),
         name="molly-scheduler",
+        daemon=True,
+    ).start()
+
+    threading.Thread(
+        target=_models_health_loop,
+        args=(_scheduler_stop,),
+        name="molly-models-health",
         daemon=True,
     ).start()
 

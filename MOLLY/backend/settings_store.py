@@ -45,6 +45,13 @@ DEFAULTS: dict[str, Any] = {
     "theme": "system",
     "model": "molly-pto",
     "ollama_url": "http://127.0.0.1:11434",
+    "provider": "ollama",            # ollama | freellmapi
+    "model_mode": "auto",            # auto | manual (для freellmapi)
+    "online_model": "",              # выбранная вручную модель FreeLLMAPI (пусто = AUTO)
+    "freellmapi": {
+        "enabled": False,
+        "url": "http://127.0.0.1:31415",
+    },
     "temperature": 0.3,
     "num_ctx": 8192,
     "max_tokens": 1024,
@@ -175,12 +182,20 @@ VALIDATORS: dict[str, Any] = {
     "theme": _choice(THEMES),
     "model": _str(200),
     "ollama_url": _url,
+    "provider": _choice(("ollama", "freellmapi")),
+    "model_mode": _choice(("auto", "manual")),
+    "online_model": _str(200),
     "temperature": _float(0.0, 2.0),
     "num_ctx": _int(512, 131072),
     "max_tokens": _int(16, 32768),
     "keep_alive": _keep_alive,
     "excluded": _str_list(200, 500),
     "auto_reindex_minutes": _int(0, 1440),
+}
+
+FREELLMAPI_VALIDATORS: dict[str, Any] = {
+    "enabled": _bool,
+    "url": _url,
 }
 
 MAIL_VALIDATORS: dict[str, Any] = {
@@ -202,7 +217,7 @@ LAN_VALIDATORS: dict[str, Any] = {
 def _merge_defaults(data: dict[str, Any]) -> dict[str, Any]:
     result = copy.deepcopy(DEFAULTS)
     for key, value in data.items():
-        if key in ("mail", "lan"):
+        if key in ("mail", "lan", "freellmapi"):
             if isinstance(value, dict):
                 for k, v in value.items():
                     if k in result[key]:
@@ -219,8 +234,12 @@ def _validate_patch(patch: dict[str, Any]) -> dict[str, Any]:
     errors: list[str] = []
 
     for key, value in patch.items():
-        if key in ("mail", "lan"):
-            validators = MAIL_VALIDATORS if key == "mail" else LAN_VALIDATORS
+        if key in ("mail", "lan", "freellmapi"):
+            validators = {
+                "mail": MAIL_VALIDATORS,
+                "lan": LAN_VALIDATORS,
+                "freellmapi": FREELLMAPI_VALIDATORS,
+            }[key]
             if not isinstance(value, dict):
                 errors.append(f"{key}: ожидался объект")
                 continue
@@ -344,7 +363,7 @@ def update(patch: dict[str, Any]) -> dict[str, Any]:
         current = get()
 
         for key, value in clean.items():
-            if key in ("mail", "lan"):
+            if key in ("mail", "lan", "freellmapi"):
                 current[key].update(value)
             else:
                 current[key] = value

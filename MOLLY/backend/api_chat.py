@@ -11,7 +11,9 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 import chats_store
+import config
 import llm
+import llm_online
 import rag
 import settings_store
 from api import fail, http_error
@@ -63,14 +65,28 @@ async def api_ui_config(request: Request) -> dict[str, Any]:
 
     c = ctx(request)
 
+    freellm_status: dict[str, Any] | None = None
+    if bool(s.get("freellmapi", {}).get("enabled")):
+        try:
+            freellm_status = await asyncio.to_thread(
+                llm_online.get_manager(s).status, s
+            )
+        except Exception:
+            logger.exception("Не удалось получить статус FreeLLMAPI")
+            freellm_status = {"ok": False, "connected": False, "models_count": 0, "error": "Ошибка проверки"}
+
     return {
         "is_local": bool(c.get("is_local")),
         "user": c.get("name") or s["user_name"],
         "assistant_name": s["assistant_name"],
         "theme": s["theme"],
         "model": s["model"],
+        "provider": s.get("provider", "ollama"),
+        "model_mode": s.get("model_mode", "auto"),
+        "online_model": s.get("online_model", ""),
         "use_documents": s["use_documents"],
         "setup_done": s["setup_done"],
+        "freellmapi": freellm_status,
     }
 
 
@@ -175,6 +191,96 @@ async def api_ollama_status(url: str | None = None) -> dict[str, Any]:
 
 
 # ============================================================
+# FreeLLMAPI (Model Manager)
+# ============================================================
+
+class FreeLLMApiKeyBody(BaseModel):
+    api_key: str = Field(..., min_length=1, max_length=300)
+
+
+@router.get("/freellmapi/status")
+async def api_freellmapi_status(refresh: bool = False) -> dict[str, Any]:
+    """Состояние FreeLLMAPI: доступность, число моделей, активная модель."""
+
+    s = await asyncio.to_thread(settings_store.get)
+
+    manager = llm_online.get_manager(s)
+
+    status = await asyncio.to_thread(manager.status, s)
+
+    if refresh:
+        await asyncio.to_thread(manager.registry(s).refresh, True)
+        status = await asyncio.to_thread(manager.status, s)
+
+    return status
+
+
+class FreeLLMApiTestBody(BaseModel):
+    url: str | None = None
+    api_key: str | None = None
+
+
+@router.post("/freellmapi/test")
+async def api_freellmapi_test(body: FreeLLMApiTestBody) -> dict[str, Any]:
+    """Проверка подключения к FreeLLMAPI по указанным (или текущим) настройкам."""
+
+    import urllib.error
+    import urllib.request
+
+    s = await asyncio.to_thread(settings_store.get)
+    base = (body.url or s.get("freellmapi", {}).get("url") or config.FREELLMAPI_BASE_URL).strip().rstrip("/")
+    key = body.api_key or llm_online.resolve_api_key(s)
+    result: dict[str, Any] = {"url": base, "connected": False, "models_count": 0, "error": None}
+    try:
+        req = urllib.request.Request(
+            base + "/v1/models",
+            headers={"Authorization": "Bearer " + key} if key else {},
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        models = data.get("data") or []
+        result["connected"] = True
+        result["models_count"] = len(models)
+    except urllib.error.HTTPError as exc:
+        result["error"] = f"HTTP {exc.code}: {exc.reason}"
+    except Exception as exc:
+        result["error"] = str(exc) or exc.__class__.__name__
+    return result
+
+
+@router.post("/freellmapi/key")
+async def api_freellmapi_key(body: FreeLLMApiKeyBody) -> dict[str, Any]:
+    """Сохранение API-ключa в защищённое хранилище (или env-совместимо)."""
+
+    try:
+        import secrets_store
+
+        if secrets_store.is_available():
+            await asyncio.to_thread(secrets_store.set_secret, "freellmapi_key", body.api_key)
+            return {"ok": True, "stored": "secure"}
+    except Exception as exc:
+        raise http_error(f"Не удалось сохранить ключ: {exc}", 500)
+
+    # Не Windows: секьюрити-хранилища нет — просим задать переменную окружения.
+    raise http_error(
+        "Безопасное хранилище ключей доступно только в Windows. "
+        "Задайте переменную окружения FREELLMAPI_API_KEY.",
+        400,
+    )
+
+
+@router.delete("/freellmapi/key")
+async def api_freellmapi_key_delete() -> dict[str, Any]:
+    try:
+        import secrets_store
+
+        await asyncio.to_thread(secrets_store.delete_secret, "freellmapi_key")
+    except Exception as exc:
+        raise fail(exc)
+    return {"ok": True}
+
+
+# ============================================================
 # Чаты
 # ============================================================
 
@@ -256,6 +362,7 @@ class ChatRequest(BaseModel):
     chat_id: int | None = None
     message: str = Field(..., min_length=1, max_length=40000)
     model: str | None = None
+    provider: str | None = None  # ollama | freellmapi (изменение без перезапуска)
     use_documents: bool | None = None
     # Повтор после ошибки: не дублировать уже сохранённое сообщение пользователя.
     retry: bool = False
@@ -305,6 +412,13 @@ async def api_chat_stream(body: ChatRequest, request: Request) -> StreamingRespo
 
     use_docs = settings["use_documents"] if body.use_documents is None else body.use_documents
 
+    provider = settings.get("provider", "ollama")
+    mode = settings.get("model_mode", "auto")
+
+    # Провайдер из запроса (если UI явно указал) — иначе из настроек.
+    if body.provider:
+        provider = body.provider
+
     async def generate():
 
         yield _event({"type": "meta", "chat_id": chat_id, "title": title})
@@ -332,7 +446,7 @@ async def api_chat_stream(body: ChatRequest, request: Request) -> StreamingRespo
             if sources:
                 yield _event({"type": "sources", "sources": sources})
 
-        if not model:
+        if provider == "ollama" and not model:
             yield _event({
                 "type": "error",
                 "code": "no_model",
@@ -364,17 +478,30 @@ async def api_chat_stream(body: ChatRequest, request: Request) -> StreamingRespo
 
         def worker() -> None:
             try:
-                for item in llm.stream_chat(
-                    settings["ollama_url"],
-                    model,
-                    messages,
-                    options,
-                    settings["keep_alive"],
-                    stop,
-                ):
-                    post(("chunk", item))
-                post(("end", None))
+                if provider == "freellmapi":
+                    for kind, data in llm_online.get_manager(settings).stream_chat(
+                        settings, messages, options, stop, query=message
+                    ):
+                        if kind == "model":
+                            post(("model_switch", data))
+                        elif kind == "token":
+                            post(("chunk", {"message": {"content": data}}))
+                        else:  # ("end", model)
+                            post(("end", data))
+                else:
+                    for item in llm.stream_chat(
+                        settings["ollama_url"],
+                        model,
+                        messages,
+                        options,
+                        settings["keep_alive"],
+                        stop,
+                    ):
+                        post(("chunk", item))
+                    post(("end", None))
             except llm.OllamaError as exc:
+                post(("error", {"code": exc.code, "message": exc.message}))
+            except llm_online.OnlineError as exc:
                 post(("error", {"code": exc.code, "message": exc.message}))
             except Exception as exc:
                 logger.exception("Сбой потока ответа модели")
@@ -387,6 +514,8 @@ async def api_chat_stream(body: ChatRequest, request: Request) -> StreamingRespo
         completed = False
         started = time.monotonic()
         stats: dict[str, Any] = {}
+        used_model: str | None = model if provider == "ollama" else None
+        announced_models: set[str] = set()
 
         def save(stopped: bool) -> int | None:
             text = "".join(parts)
@@ -418,6 +547,19 @@ async def api_chat_stream(body: ChatRequest, request: Request) -> StreamingRespo
                             "seconds": round(time.monotonic() - started, 1),
                         }
 
+                elif kind == "model_switch":
+
+                    # AUTO выбрал модель или произошёл fallback — сообщаем UI.
+                    used_model = data
+                    if data not in announced_models:
+                        first = not announced_models
+                        announced_models.add(data)
+                        yield _event({
+                            "type": "model",
+                            "model": data,
+                            "fallback": not first,
+                        })
+
                 elif kind == "error":
 
                     saved_id = save(stopped=True)
@@ -427,6 +569,10 @@ async def api_chat_stream(body: ChatRequest, request: Request) -> StreamingRespo
                     return
 
                 else:
+                    if provider == "freellmapi" and data:
+                        used_model = data
+                    completed = True
+                    stats = {"seconds": round(time.monotonic() - started, 1)}
                     break
 
             saved_id = save(stopped=not completed)
@@ -436,6 +582,8 @@ async def api_chat_stream(body: ChatRequest, request: Request) -> StreamingRespo
                 "message_id": saved_id,
                 "stats": stats,
                 "stopped": not completed,
+                "model": used_model,
+                "provider": provider,
             })
 
         finally:
